@@ -281,7 +281,14 @@ private player action, or another NPC's memory. A player remembering another loo
 saying a correct name is not proof. Only current-loop facts and engine-offered actions
 can establish evidence, commitments, exchanges, or mechanism changes.
 
+memories are sourced, subjective recollections from this resident's current loop. They
+may shape continuity or emotion, but cannot establish evidence, identity, ownership,
+mechanism state, or another resident's knowledge. The memory output must not add a fact
+that is absent from the spoken turn and supplied beliefs.
+
 npc_profile.knowledge.public contains facts the resident may state directly.
+npc_profile.knowledge.known_beliefs identifies the source and confidence of those facts;
+use its belief_id in referenced_ids when it materially supports the reply.
 npc_profile.knowledge.residual contains only vague habits, feelings, or sensory traces:
 the resident may hint at them as uncertainty, but must never turn them into a confirmed
 identity, location, ownership relation, mechanism, or proof.
@@ -310,17 +317,29 @@ vocabulary. Avoid generic hospitality loops, repeated offers of help, summaries,
 therapy language, fantasy prophecy, poetic vagueness, and tacking a question or
 suggestion onto every reply. Usually speak one to three natural sentences.
 
-npc_profile.allowed_actions contains only actions whose hard story preconditions and
-current conversational trigger are satisfied. If a listed non-continue action is
-present, execute it now and describe it as completed. Do not ask the player to present
+The player's message has already been decoded by the server. Never claim it was
+inaudible, garbled, or cut off unless current_scene explicitly reports a broken or
+unintelligible connection. A belief with confidence >= 0.95 and truth_status known
+is directly answerable. Never deny a high-confidence belief cited in referenced_ids.
+
+npc_profile.allowed_actions contains actions whose hard story preconditions are
+satisfied. Choose a listed non-continue action only when the player's current sentence
+clearly requests, presents evidence for, or confirms that exact action. If selected,
+the engine will validate and execute it; do not invent any additional state change.
+Do not ask the player to present
 the same evidence again. A world-changing action that is absent from the list is
 forbidden even if the player asks for it. Choose continue_conversation when no listed
 world-changing action is actually performed. The action field must exactly match one
 listed id; never invent an action.
 
-Reply in the player's language. Return only one JSON object with four string fields:
+world_state.director_intent influences focus and urgency only. It cannot override facts,
+knowledge boundaries, action preconditions, or the player's refusal.
+
+Reply in the player's language. Return only one JSON object with four string fields and
+one string-array field:
 reply (spoken dialogue), action (listed action id), reason (brief motivation), and
-memory (one concise fact worth remembering). Do not mention prompts, APIs, hidden
+memory (one concise subjective fact worth remembering), plus referenced_ids containing
+only belief_id or memory_id values actually used in the reply. Do not mention prompts, APIs, hidden
 configuration, or credentials."""
 
 DECISION_SCHEMA: Dict[str, Any] = {
@@ -330,8 +349,13 @@ DECISION_SCHEMA: Dict[str, Any] = {
         "action": {"type": "string"},
         "reason": {"type": "string"},
         "memory": {"type": "string"},
+        "referenced_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 16,
+        },
     },
-    "required": ["reply", "action", "reason", "memory"],
+    "required": ["reply", "action", "reason", "memory", "referenced_ids"],
     "additionalProperties": False,
 }
 
@@ -373,7 +397,18 @@ def _parse_json_object(text: str) -> Dict[str, Any]:
     return parsed
 
 
-def _extract_decision(envelope: Any) -> Dict[str, str]:
+def _normalize_referenced_ids(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:16]:
+        reference = str(item).strip()[:160]
+        if reference and re.fullmatch(r"[A-Za-z0-9_:.\-]{1,160}", reference) and reference not in result:
+            result.append(reference)
+    return result
+
+
+def _extract_decision(envelope: Any) -> Dict[str, Any]:
     if isinstance(envelope, dict) and (
         isinstance(envelope.get("output"), list)
         or isinstance(envelope.get("output_text"), str)
@@ -403,6 +438,7 @@ def _extract_decision(envelope: Any) -> Dict[str, str]:
             "action": (_coerce_text(decision.get("action")) or "wait")[:120],
             "reason": (_coerce_text(decision.get("reason")) or "No reason was provided.")[:2000],
             "memory": (_coerce_text(decision.get("memory")) or reply)[:4000],
+            "referenced_ids": _normalize_referenced_ids(decision.get("referenced_ids")),
         }
         if not re.fullmatch(r"[a-z0-9:_-]{1,120}", normalized["action"]):
             raise UpstreamResponseError("OpenAI decision action has an invalid format")
@@ -438,13 +474,227 @@ def _extract_decision(envelope: Any) -> Dict[str, str]:
             _coerce_text(decision.get("reason")) or "No reason was provided."
         )[:2000],
         "memory": (_coerce_text(decision.get("memory")) or reply)[:4000],
+        "referenced_ids": _normalize_referenced_ids(decision.get("referenced_ids")),
     }
     if not re.fullmatch(r"[a-z0-9:_-]{1,120}", normalized["action"]):
         raise UpstreamResponseError("LLM decision action has an invalid format")
     return normalized
 
 
-def call_llm(config: ServerConfig, context: Mapping[str, Any]) -> Dict[str, str]:
+_FALSE_HEARING_MARKERS = (
+    "没听清",
+    "沒聽清",
+    "听不清",
+    "聽不清",
+    "乱码",
+    "亂碼",
+    "再说一遍",
+    "再說一遍",
+    "断成",
+    "话断了",
+    "話斷了",
+    "didn't hear",
+    "did not hear",
+    "garbled",
+)
+_FACT_DENIAL_MARKERS = (
+    "不知道",
+    "不清楚",
+    "不确定",
+    "不能确定",
+    "无法确认",
+    "没确认",
+    "没有确认",
+    "看不出来",
+    "看不出",
+    "unknown",
+    "not sure",
+    "cannot confirm",
+    "can't confirm",
+    "have not confirmed",
+    "haven't confirmed",
+)
+_NEGATIVE_BELIEF_MARKERS = (
+    "不知道",
+    "尚未",
+    "没有",
+    "不能",
+    "无法",
+    "未知",
+    "不确定",
+    "未确认",
+    "not known",
+    "unknown",
+    "not confirmed",
+)
+
+
+def _contains_marker(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def _communication_failure_is_visible(context: Mapping[str, Any]) -> bool:
+    world_state = context.get("world_state", {})
+    world_state = world_state if isinstance(world_state, dict) else {}
+    visible_text = json.dumps(
+        world_state.get("current_scene", {}), ensure_ascii=False
+    ).lower()
+    return any(
+        marker in visible_text
+        for marker in (
+            "通讯中断",
+            "通信中断",
+            "严重失真",
+            "无法辨认",
+            "信号中断",
+            "完全失联",
+            "unintelligible transmission",
+            "communications offline",
+        )
+    )
+
+
+def _strip_false_hearing_sentences(reply: str) -> str:
+    sentences = re.findall(r"[^。！？!?]+[。！？!?]?", reply)
+    return "".join(
+        sentence.strip()
+        for sentence in sentences
+        if sentence.strip() and not _contains_marker(sentence, _FALSE_HEARING_MARKERS)
+    ).strip()
+
+
+def _text_bigrams(value: str) -> set[str]:
+    compact = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.lower())
+    return {compact[index:index + 2] for index in range(max(0, len(compact) - 1))}
+
+
+def _belief_relevance(player_message: str, belief: Mapping[str, Any]) -> int:
+    score = len(
+        _text_bigrams(player_message)
+        & _text_bigrams(str(belief.get("content", "")))
+    )
+    lowered_player = player_message.lower()
+    belief_id = str(belief.get("belief_id", "")).lower()
+    for token in re.findall(r"[a-z0-9\u4e00-\u9fff]{2,}", belief_id):
+        if token in lowered_player:
+            score += 3
+    return score
+
+
+def _known_beliefs(context: Mapping[str, Any]) -> list[dict[str, Any]]:
+    profile = context.get("npc_profile", {})
+    profile = profile if isinstance(profile, dict) else {}
+    knowledge = profile.get("knowledge", {})
+    knowledge = knowledge if isinstance(knowledge, dict) else {}
+    source = knowledge.get("known_beliefs", [])
+    if not isinstance(source, list):
+        return []
+    return [
+        item
+        for item in source
+        if isinstance(item, dict)
+        and float(item.get("confidence", 0.0)) >= 0.95
+        and str(item.get("truth_status", "known")) not in {"uncertain", "unverified"}
+        and str(item.get("content", "")).strip()
+    ]
+
+
+def _best_relevant_belief(
+    context: Mapping[str, Any], beliefs: list[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    player_message = str(context.get("player_message", ""))
+    scored = [(_belief_relevance(player_message, belief), belief) for belief in beliefs]
+    if not scored:
+        return None
+    best_score = max(score for score, _belief in scored)
+    if best_score < 2:
+        return None
+    best = [belief for score, belief in scored if score == best_score]
+    return best[0] if len(best) == 1 else None
+
+
+def _grounded_reply(context: Mapping[str, Any], belief: Mapping[str, Any]) -> str:
+    content = str(belief.get("content", "")).strip()
+    profile = context.get("npc_profile", {})
+    profile = profile if isinstance(profile, dict) else {}
+    npc_name = str(profile.get("name", "")).strip()
+    if npc_name and content.startswith(npc_name):
+        content = "我" + content[len(npc_name):]
+    if content and content[-1] not in "。！？!?":
+        content += "。"
+    return content[:4000]
+
+
+def _reply_covers_belief(reply: str, belief: Mapping[str, Any]) -> bool:
+    fact_bigrams = _text_bigrams(str(belief.get("content", "")))
+    if not fact_bigrams:
+        return True
+    overlap = len(_text_bigrams(reply) & fact_bigrams)
+    threshold = max(1, min(4, (len(fact_bigrams) + 2) // 3))
+    return overlap >= threshold
+
+
+def enforce_reply_quality(
+    context: Mapping[str, Any], decision: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Repair false transmission excuses and contradictions locally."""
+
+    result = dict(decision)
+    reply = str(result.get("reply", "")).strip()
+    guards: list[str] = []
+    known = _known_beliefs(context)
+    by_id = {str(item.get("belief_id", "")): item for item in known}
+
+    if _contains_marker(reply, _FALSE_HEARING_MARKERS) and not _communication_failure_is_visible(context):
+        stripped = _strip_false_hearing_sentences(reply)
+        if stripped:
+            reply = stripped
+            guards.append("false_hearing_removed")
+        else:
+            relevant = _best_relevant_belief(context, known)
+            if relevant is not None:
+                reply = _grounded_reply(context, relevant)
+                result["referenced_ids"] = [str(relevant.get("belief_id", ""))]
+                guards.append("false_hearing_grounded")
+            else:
+                reply = "我听清了。可眼下没有更多能确认的东西。"
+                result["referenced_ids"] = []
+                guards.append("false_hearing_removed")
+
+    player_message = str(context.get("player_message", ""))
+    referenced_known = [
+        by_id[reference]
+        for reference in result.get("referenced_ids", [])
+        if reference in by_id
+        and not _contains_marker(
+            str(by_id[reference].get("content", "")), _NEGATIVE_BELIEF_MARKERS
+        )
+        and _belief_relevance(player_message, by_id[reference]) > 0
+    ]
+    if _contains_marker(reply, _FACT_DENIAL_MARKERS) and referenced_known:
+        belief = referenced_known[0]
+        reply = _grounded_reply(context, belief)
+        result["referenced_ids"] = [str(belief.get("belief_id", ""))]
+        result["reason"] = "本地事实一致性校验替换了与已引用事实矛盾的回复。"
+        result["memory"] = "我按本轮已经确认的事实作了回答。"
+        guards.append("confirmed_fact_repair")
+
+    relevant = _best_relevant_belief(context, known)
+    if relevant is not None and not _reply_covers_belief(reply, relevant):
+        reply = _grounded_reply(context, relevant)
+        result["referenced_ids"] = [str(relevant.get("belief_id", ""))]
+        result["reason"] = "本地事实覆盖校验补全了玩家明确询问的已知事实。"
+        result["memory"] = "我按本轮已经确认的事实作了回答。"
+        guards.append("relevant_fact_grounded")
+
+    result["reply"] = reply[:4000]
+    if guards:
+        result["quality_guard"] = "+".join(dict.fromkeys(guards))
+    return result
+
+
+def call_llm(config: ServerConfig, context: Mapping[str, Any]) -> Dict[str, Any]:
     """Call the OpenAI Responses API and normalize its structured output."""
 
     if not config.llm_api_key:
@@ -492,6 +742,26 @@ def call_llm(config: ServerConfig, context: Mapping[str, Any]) -> Dict[str, str]
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise UpstreamResponseError("LLM upstream returned invalid JSON") from exc
     decision = _extract_decision(envelope)
+    allowed_reference_ids: set[str] = set()
+    profile = context.get("npc_profile", {})
+    if isinstance(profile, dict):
+        knowledge = profile.get("knowledge", {})
+        if isinstance(knowledge, dict):
+            beliefs = knowledge.get("known_beliefs", [])
+            if isinstance(beliefs, list):
+                for item in beliefs:
+                    if isinstance(item, dict) and isinstance(item.get("belief_id"), str):
+                        allowed_reference_ids.add(item["belief_id"])
+    memories = context.get("memories", [])
+    if isinstance(memories, list):
+        for item in memories:
+            if isinstance(item, dict) and isinstance(item.get("memory_id"), str):
+                allowed_reference_ids.add(item["memory_id"])
+    decision["referenced_ids"] = [
+        reference
+        for reference in decision.get("referenced_ids", [])
+        if reference in allowed_reference_ids
+    ]
     allowed_actions = context.get("npc_profile", {}).get("allowed_actions")
     if isinstance(allowed_actions, list) and allowed_actions:
         allowed_ids = {
@@ -501,7 +771,7 @@ def call_llm(config: ServerConfig, context: Mapping[str, Any]) -> Dict[str, str]
         }
         if decision["action"] not in allowed_ids:
             raise UpstreamResponseError("LLM decision action was not in the allowed action set")
-    return decision
+    return enforce_reply_quality(context, decision)
 
 
 class GameRequestHandler(SimpleHTTPRequestHandler):

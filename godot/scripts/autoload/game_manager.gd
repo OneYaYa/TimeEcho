@@ -55,7 +55,9 @@ func create_initial_state(persistent: Dictionary = {}) -> Dictionary:
 		"knowledge": (persistent.get("knowledge", {}) as Dictionary).duplicate(true),
 		"photos": (persistent.get("photos", {}) as Dictionary).duplicate(true),
 		"journal": (persistent.get("journal", []) as Array).duplicate(true),
-		"npcNotes": (persistent.get("npcNotes", {}) as Dictionary).duplicate(true),
+		# Ordinary resident dialogue is current-loop state. Only explicitly authored
+		# exceptional characters may gain cross-loop memory in a future rule.
+		"npcNotes": {},
 		"npcs": npc_states,
 		"conversationOpen": false,
 		"cinematic": null,
@@ -193,4 +195,3 @@ func save(notify: bool = false) -> bool:
 	if notify and ok:
 		EventBus.state_changed.emit(state)
 	return ok
-

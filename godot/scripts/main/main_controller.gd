@@ -163,7 +163,7 @@ func _on_dialogue_action(action_id: String) -> void:
 	var result: Dictionary = DialogueManager.apply_action(current_npc_id, action_id, GameManager.state)
 	var npc: Dictionary = DataManager.get_npc(current_npc_id)
 	ui.append_dialogue(str(npc.get("name", "镇民")), str(result.get("text", "对方没有改变决定。")))
-	_record_dialogue_turn(current_npc_id, "[%s]" % action_id, str(result.get("text", "")), action_id)
+	_record_dialogue_turn(current_npc_id, "[%s]" % action_id, str(result.get("text", "")), action_id, str(result.get("text", "")))
 	if not str(result.get("puzzle", "")).is_empty():
 		GameManager.state["conversationOpen"] = false
 		flow.transition(GameFlowStateMachine.State.PUZZLE)
@@ -188,7 +188,7 @@ func _on_dialogue_text(message: String) -> void:
 	var reply: String = str(result.get("text", "湖边的风吞掉了这句话。"))
 	ui.append_dialogue(str(npc.get("name", "镇民")), reply)
 	ui.append_dialogue("SYSTEM", "%s · 剧情状态由本地规则验证" % result.get("provider", "local-rules"))
-	_record_dialogue_turn(npc_id, message, reply, str(result.get("action", "continue_conversation")))
+	_record_dialogue_turn(npc_id, message, reply, str(result.get("action", "continue_conversation")), str(result.get("memory", reply)))
 	ui.refresh_dialogue_actions(DialogueManager.get_actions(npc_id, GameManager.state))
 	if not str(result.get("puzzle", "")).is_empty():
 		GameManager.state["conversationOpen"] = false
@@ -199,10 +199,12 @@ func _on_dialogue_text(message: String) -> void:
 	_talk_pending = false
 
 
-func _record_dialogue_turn(npc_id: String, player_text: String, reply: String, action: String) -> void:
+func _record_dialogue_turn(npc_id: String, player_text: String, reply: String, action: String, subjective_memory: String = "") -> void:
 	var notes_by_npc: Dictionary = GameManager.state.get("npcNotes", {}) as Dictionary
 	var notes: Array = notes_by_npc.get(npc_id, []) as Array
-	notes.append({"loop": int(GameManager.state.get("loopCount", 0)) + 1, "player": player_text, "reply": reply, "action": action})
+	var current_loop := int(GameManager.state.get("loopCount", 0)) + 1
+	var event_id := "dialogue:%d:%s:%d" % [current_loop, npc_id, notes.size() + 1]
+	notes.append({"event_id": event_id, "loop": current_loop, "player": player_text, "reply": reply, "action": action})
 	if notes.size() > 16:
 		notes = notes.slice(notes.size() - 16)
 	notes_by_npc[npc_id] = notes
@@ -211,8 +213,21 @@ func _record_dialogue_turn(npc_id: String, player_text: String, reply: String, a
 	if npcs.has(npc_id):
 		var npc_state: Dictionary = npcs[npc_id] as Dictionary
 		var memories: Array = npc_state.get("memories", []) as Array
-		memories.push_front({"text": reply, "importance": 1, "loop": int(GameManager.state.get("loopCount", 0)) + 1})
+		var memory_text := subjective_memory.strip_edges().left(500)
+		if memory_text.is_empty():
+			memory_text = reply.left(500)
+		memories.push_front({
+			"memory_id": "memory:%s" % event_id,
+			"event_ref": event_id,
+			"subjective_text": memory_text,
+			"salience": 0.8 if action != "continue_conversation" else 0.45,
+			"valence": "tense" if action != "continue_conversation" else "neutral",
+			"tier": "current_loop",
+			"loop": current_loop,
+		})
 		npc_state["memories"] = memories.slice(0, mini(8, memories.size()))
+		npcs[npc_id] = npc_state
+		GameManager.state["npcs"] = npcs
 
 
 func _on_dialogue_closed() -> void:

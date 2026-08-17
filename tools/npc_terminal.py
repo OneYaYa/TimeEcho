@@ -33,6 +33,9 @@ NPC_ORDER = [
     "florence",
     "ada",
 ]
+CONTEXT_TEMPLATE_VERSION = "time-echo-terminal-context-v2"
+MAX_CONTEXT_DIALOGUE = 8
+MAX_CONTEXT_MEMORIES = 8
 REPAIR_IDS = ("master", "chapel", "tide")
 BOOLEAN_WORDS = {
     "1": True,
@@ -1264,21 +1267,134 @@ def apply_terminal_action(
     raise ValueError(f"动作 {action_id} 没有终端执行器")
 
 
-def build_request(
+def _entry_is_current_loop(entry: Any, current_loop: int) -> bool:
+    if not isinstance(entry, Mapping):
+        return False
+    try:
+        return int(entry.get("loop", current_loop)) == current_loop
+    except (TypeError, ValueError):
+        return False
+
+
+def _terminal_scene_mode(
+    npc_id: str, state: Mapping[str, Any]
+) -> Dict[str, Any]:
+    flags = state.get("flags", {})
+    flags = flags if isinstance(flags, Mapping) else {}
+    if int(state.get("minute", 360)) >= 1435:
+        return {
+            "id": "reset_imminent",
+            "trigger": "reset_warning",
+            "energy": "urgent",
+            "behavior_rules": ["短句", "只说此刻已知事实", "不剧透结局"],
+        }
+    if npc_id == "ada" and not bool(flags.get("ada_duty_anchored")):
+        return {
+            "id": "identity_fragment",
+            "trigger": "identity_not_anchored",
+            "energy": "fading",
+            "behavior_rules": [
+                "只使用已锚定身份片段",
+                "句子可有停顿",
+                "玩家说出答案不能代替证据",
+            ],
+        }
+    return {
+        "id": "working_resident",
+        "trigger": "default",
+        "energy": "grounded",
+        "behavior_rules": [
+            "先回答实际问题",
+            "使用职业词汇但不口号化",
+            "不在每句结尾追加建议",
+        ],
+    }
+
+
+def _terminal_director_intent(
+    allowed_actions: Sequence[Mapping[str, Any]], state: Mapping[str, Any]
+) -> Dict[str, Any]:
+    urgency = "foreshadow"
+    priority = 20
+    goal = "回应当前话题；不知道时明确不知道，不主动重复线索。"
+    if int(state.get("minute", 360)) >= 1435:
+        urgency = "emergency"
+        priority = 100
+        goal = "承认白光临近带来的当下变化，但不替玩家选择结局。"
+    elif len(allowed_actions) > 1:
+        urgency = "guidance"
+        priority = 50
+        goal = "玩家明确请求已开放动作时才提出动作；否则继续对话。"
+    return {
+        "goal": goal,
+        "urgency": urgency,
+        "priority": priority,
+        "preconditions": ["npc_present", "current_loop"],
+        "forbidden_moves": [
+            "泄露未获得线索",
+            "替玩家决定结局",
+            "把持有说成已经出示",
+        ],
+        "ttl_turns": 1,
+        "max_mentions": 1,
+        "cooldown_turns": 2,
+    }
+
+
+def _estimate_context_tokens(value: Any) -> int:
+    return max(1, (len(json.dumps(value, ensure_ascii=False)) + 2) // 3)
+
+
+def compile_context(
     world: Mapping[str, Any],
     npc: Mapping[str, Any],
     state: Mapping[str, Any],
     player_message: str,
 ) -> Dict[str, Any]:
-    """Build a production-shaped request without leaking omniscient state."""
+    """Compile the runtime-shaped request plus a local-only replay trace."""
 
     npc_id = str(npc["id"])
     npc_state = state.get("npcs", {}).get(npc_id, {})
+    current_loop = int(state.get("loopCount", 0)) + 1
+    raw_dialogue = list(npc_state.get("dialogue", []))
     recent_dialogue = [
-        entry
-        for entry in list(npc_state.get("dialogue", []))
+        {
+            "event_id": str(
+                entry.get("event_id", f"dialogue:{npc_id}:{index}")
+            )[:120],
+            "player": str(entry.get("player", ""))[:400],
+            "reply": str(entry.get("reply", ""))[:600],
+            "action": str(
+                entry.get("action", "continue_conversation")
+            )[:120],
+        }
+        for index, entry in enumerate(raw_dialogue)
+        if isinstance(entry, Mapping)
+        and _entry_is_current_loop(entry, current_loop)
         if _context_entry_is_supported(npc_id, entry)
-    ][-8:]
+    ][-MAX_CONTEXT_DIALOGUE:]
+    raw_memories = list(npc_state.get("memories", []))
+    memories = [
+        {
+            "memory_id": str(
+                entry.get("memory_id", f"memory:{npc_id}:{index}")
+            )[:120],
+            "subjective_text": str(
+                entry.get("subjective_text", entry.get("text", ""))
+            )[:500],
+            "event_ref": str(entry.get("event_ref", ""))[:120],
+            "salience": min(1.0, max(0.0, float(entry.get("salience", 1.0)))),
+            "valence": str(entry.get("valence", "neutral"))[:30],
+            "tier": "current_loop",
+            "truth_status": "subjective_recollection",
+            "source": "dialogue_event",
+        }
+        for index, entry in enumerate(raw_memories)
+        if isinstance(entry, Mapping)
+        and _entry_is_current_loop(entry, current_loop)
+        and _context_entry_is_supported(npc_id, entry)
+        and str(entry.get("subjective_text", entry.get("text", ""))).strip()
+    ][:MAX_CONTEXT_MEMORIES]
     triggered_action = infer_plot_action(
         npc_id,
         state,
@@ -1308,6 +1424,25 @@ def build_request(
     if npc_id == "ada" and not state_flags.get("ada_duty_anchored"):
         profile_goal = "弄清自己缺失的姓名、住处、职责和面孔，并让外部证据逐项固定这些记忆"
         profile_concern = "害怕所有人最终接受一个从未有过她的世界，但无法说明自己为何被删除"
+    public_facts = visible_facts(npc, state)
+    known_beliefs = [
+        {
+            "belief_id": f"npc:{npc_id}:visible:{index}",
+            "content": str(fact)[:300],
+            "truth_status": "known",
+            "confidence": 1.0,
+            "source": "npc_visible_projection",
+        }
+        for index, fact in enumerate(public_facts[:24])
+    ]
+    scene_mode = _terminal_scene_mode(npc_id, state)
+    relationship_state = {
+        "level": str(npc_state.get("relationshipLevel", "stranger")),
+        "trust": relationship,
+        "fear": 20,
+        "debt": 0,
+        "source": "authoritative_relationship_projection",
+    }
     profile = {
         "id": profile_id,
         "name": profile_name,
@@ -1316,12 +1451,26 @@ def build_request(
         "goal": profile_goal,
         "voice": npc.get("voice"),
         "concern": profile_concern,
+        "persona_core": {
+            "identity": f"{profile_name} · {profile_role}",
+            "long_term_goal": profile_goal,
+            "default_strategy": profile_concern,
+            "voice": npc.get("voice"),
+            "stable_boundaries": [
+                "不把玩家跨轮记忆当作本轮证据",
+                "不读取其他 NPC 的记忆",
+                "不从物品名称推断隐藏地点",
+            ],
+        },
+        "active_scene_mode": scene_mode,
         "knowledge": {
-            "public": visible_facts(npc, state),
+            "public": public_facts,
             "residual": copy.deepcopy(
                 npc.get("knowledge", {}).get("suggestive", [])
             ),
+            "known_beliefs": known_beliefs,
         },
+        "relationship_state": relationship_state,
         "allowed_actions": allowed_actions,
         "secretTrust": 65,
         "relationship": relationship,
@@ -1340,10 +1489,24 @@ def build_request(
             "action_id": npc_state.get("actionId"),
         },
     }
+    director_intent = _terminal_director_intent(allowed_actions, state)
+    place_id = str(npc_state.get("placeId", ""))
     world_state = {
         "day": state.get("dayLabel", "SATURDAY"),
         "minute": int(state.get("minute", 360)),
-        "loop": int(state.get("loopCount", 0)) + 1,
+        "loop": current_loop,
+        "snapshot_version": int(state.get("loopCount", 0)) * 1440
+        + int(state.get("minute", 360)),
+        "current_scene": {
+            "place_id": place_id,
+            "place_name": place_id,
+            "npc_present": True,
+            "world_time": (
+                f"{state.get('dayLabel', 'SATURDAY')} "
+                f"{int(state.get('minute', 360)) // 60:02d}:"
+                f"{int(state.get('minute', 360)) % 60:02d}"
+            ),
+        },
         "story_context": {
             "public": copy.deepcopy(
                 world.get("storyContext", {}).get("publicFacts", [])
@@ -1365,17 +1528,70 @@ def build_request(
             "player_remembered_only": False,
         },
         "recent_dialogue": copy.deepcopy(recent_dialogue),
+        "director_intent": director_intent,
     }
-    return {
+    request = {
         "npc_profile": profile,
         "world_state": world_state,
         "player_message": str(player_message)[:2000],
-        "memories": copy.deepcopy([
-            entry
-            for entry in list(npc_state.get("memories", []))
-            if _context_entry_is_supported(str(npc["id"]), entry)
-        ][:8]),
+        "memories": copy.deepcopy(memories),
     }
+    included_ids = [item["belief_id"] for item in known_beliefs]
+    included_ids.extend(item["memory_id"] for item in memories)
+    dropped = []
+    old_dialogue_count = max(0, len(raw_dialogue) - len(recent_dialogue))
+    old_memory_count = max(0, len(raw_memories) - len(memories))
+    if old_dialogue_count:
+        dropped.append(
+            {
+                "partition": "recent_dialogue",
+                "reason": "old_loop_unsupported_or_quota",
+                "count": old_dialogue_count,
+            }
+        )
+    if old_memory_count:
+        dropped.append(
+            {
+                "partition": "memories",
+                "reason": "old_loop_unsupported_or_quota",
+                "count": old_memory_count,
+            }
+        )
+    trace = {
+        "trace_id": (
+            f"loop:{current_loop}:npc:{npc_id}:turn:{len(recent_dialogue) + 1}"
+        ),
+        "template_version": CONTEXT_TEMPLATE_VERSION,
+        "snapshot_version": world_state["snapshot_version"],
+        "included_ids": included_ids,
+        "dropped": dropped,
+        "partition_token_estimates": {
+            "persona": _estimate_context_tokens(profile["persona_core"]),
+            "scene": _estimate_context_tokens(world_state["current_scene"]),
+            "beliefs": _estimate_context_tokens(known_beliefs),
+            "memories": _estimate_context_tokens(memories),
+            "recent_dialogue": _estimate_context_tokens(recent_dialogue),
+            "director_intent": _estimate_context_tokens(director_intent),
+        },
+        "hard_filters": [
+            "npc_id",
+            "current_loop",
+            "npc_visible_facts",
+            "hard_action_prerequisites",
+        ],
+    }
+    return {"request": request, "trace": trace}
+
+
+def build_request(
+    world: Mapping[str, Any],
+    npc: Mapping[str, Any],
+    state: Mapping[str, Any],
+    player_message: str,
+) -> Dict[str, Any]:
+    """Compatibility wrapper returning only the model-visible request."""
+
+    return compile_context(world, npc, state, player_message)["request"]
 
 
 def format_clock(state: Mapping[str, Any]) -> str:
@@ -1498,6 +1714,7 @@ class NpcTerminal:
         self.dry_run = dry_run
         self.state_file = state_file
         self.last_message = "请按当前状态介绍你知道的情况。"
+        self.last_context_trace: Dict[str, Any] = {}
         self.items = {entry["id"]: entry for entry in world["items"]}
         self.evidence = {entry["id"]: entry for entry in world["evidence"]}
 
@@ -1572,13 +1789,17 @@ class NpcTerminal:
             print("    - 无（只能继续对话）")
 
     def print_context(self, message: Optional[str] = None) -> None:
-        request = build_request(
+        compilation = compile_context(
             self.world,
             self.current_npc,
             self.state,
             message or self.last_message,
         )
+        request = compilation["request"]
+        self.last_context_trace = compilation["trace"]
         print(json.dumps(request, ensure_ascii=False, indent=2))
+        print("\n[LOCAL TRACE · 不发送给模型]")
+        print(json.dumps(self.last_context_trace, ensure_ascii=False, indent=2))
 
     def print_facts(self) -> None:
         print("\n各 NPC 当前认知投影：")
@@ -1850,12 +2071,16 @@ class NpcTerminal:
         if not cleaned:
             return
         self.last_message = cleaned
-        request = build_request(
+        compilation = compile_context(
             self.world, self.current_npc, self.state, cleaned
         )
+        request = compilation["request"]
+        self.last_context_trace = compilation["trace"]
         if self.dry_run:
             print("\n[DRY-RUN] 将发送以下上下文；未调用 API：")
             print(json.dumps(request, ensure_ascii=False, indent=2))
+            print("\n[LOCAL TRACE · 不发送给模型]")
+            print(json.dumps(self.last_context_trace, ensure_ascii=False, indent=2))
             return
         if not self.config.llm_configured:
             print(
@@ -1931,6 +2156,7 @@ class NpcTerminal:
             "player": cleaned,
             "reply": final_reply,
             "action": resolved_action,
+            "loop": self.state["loopCount"] + 1,
         })
         del npc_state["dialogue"][:-8]
         try:

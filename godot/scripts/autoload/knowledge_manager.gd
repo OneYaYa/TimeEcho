@@ -45,5 +45,4 @@ func persistent_snapshot(state: Dictionary) -> Dictionary:
 		"knowledge": (state.get("knowledge", {}) as Dictionary).duplicate(true),
 		"photos": (state.get("photos", {}) as Dictionary).duplicate(true),
 		"journal": persistent_journal,
-		"npcNotes": (state.get("npcNotes", {}) as Dictionary).duplicate(true),
 	}

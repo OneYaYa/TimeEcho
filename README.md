@@ -25,7 +25,6 @@ http://127.0.0.1:8000
 
 完整 Godot 4.6 工程位于 [`godot/`](godot/)，主场景为 `godot/scenes/main/main.tscn`。使用 Godot 4.6 打开 `godot/project.godot`，或在仓库根目录运行：
 
-
 ```在powershell运行启动游戏
 & "your-path-to-godot.exe" --path .\godot
 ```
@@ -36,6 +35,7 @@ Godot 版保留相同 JSON 数据、18 个地点、7 位 NPC、时间循环、�
 - [迁移分析](godot/MIGRATION_ANALYSIS.md)
 - [18 个地图实际渲染画廊](godot/MAP_RENDER_GALLERY.md)
 - [测试清单](godot/TEST_CHECKLIST.md)
+- [AI NPC 技术升级说明](godot/docs/AI_NPC_TECH_UPGRADE.md)
 
 Godot 自动测试：
 
@@ -83,6 +83,14 @@ python godot/tests/validate_project.py
 
 未配置大模型时，七名居民使用按职业与性格手写的本地对话规则，游戏流程完整可玩。
 
+### Godot AI NPC v2
+
+Godot 主版本现在使用独立上下文编译器，而不是把角色卡和世界状态直接拼进 Prompt。每轮只投影当前 NPC 有资格知道的规范事实、本轮共同证据、主观记忆、关系、场景模式和带 TTL/冷却字段的导演意图；角色写作规则与秘密知识也已拆开，身份未固定的艾达不会从角色卡偷看到姓名或职责。
+
+大模型可以把自然语言理解为一个已满足硬前置条件的剧情动作提案，但不能直接改状态。返回动作会在当前世界快照上重新经过 `DialogueManager` 白名单验证，再由本地规则提交；等待模型期间如果循环、物品或证据发生变化，动作会被拒绝。生成后质量门会剥离无依据的“没听清”，补全玩家明确询问却被模型回避的高置信事实，并拒绝台词否认自己的引用。每轮还会生成事实/记忆引用 ID、分区 Token 估算、裁剪原因、`quality_guard` 与最近 64 轮本地 trace。
+
+普通居民的对话和主观记忆只属于当前循环，白光重置时清空；玩家日志、已获得知识和按设计保留的照片继续跨循环。终端实验台现在也按当前循环硬过滤普通对话与主观记忆，并在不发送给模型的独立区显示上下文 trace；“保留记忆”开关仍只是回归实验能力，不代表正式游戏规则。
+
 ## 终端 AI NPC 状态实验台
 
 不启动游戏也可以逐个测试 NPC。交互模式：
@@ -106,7 +114,7 @@ NPC 动作进一步区分“玩家持有”“当面出示”“解释证据关�
 
 动作效果和固定剧情台词仍由本地规则执行，模型不能自行改写物品、证据或剧情旗标。
 
-成功的在线对话会把最多八条记忆只写入当前 NPC，并自动保存到 tmp/npc-terminal-state.json。之后可用 --load-state 恢复；应用剧情预设默认保留各 NPC 自己的记忆，/reset all 才会清空。
+终端实验台中的成功在线对话会把最多八条记忆只写入当前 NPC，并自动保存到 tmp/npc-terminal-state.json。之后可用 --load-state 恢复；应用剧情预设默认保留各 NPC 自己的记忆，/reset all 才会清空。这是测试长对话一致性的显式实验模式；Godot 正式游戏会在白光重置时清除普通 NPC 记忆。
 
 ## 大模型配置
 

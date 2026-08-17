@@ -63,8 +63,21 @@ func get_actions(npc_id: String, state: Dictionary) -> Array[Dictionary]:
 	return actions
 
 
+func is_action_available(npc_id: String, action_id: String, state: Dictionary) -> bool:
+	for action: Dictionary in get_actions(npc_id, state):
+		if str(action.get("id", "")) == action_id:
+			return true
+	return false
+
+
 func apply_action(npc_id: String, action_id: String, state: Dictionary) -> Dictionary:
 	var response: Dictionary = {"speaker": npc_id, "text": "对方没有改变决定。", "puzzle": ""}
+	# Re-evaluate the authoritative whitelist at commit time. This closes races
+	# caused by loop reset, time advance, inventory changes, or delayed AI replies.
+	if not is_action_available(npc_id, action_id, state):
+		response["text"] = "眼前的条件已经对不上了；这一步没有发生。"
+		response["rejected"] = true
+		return response
 	var flags: Dictionary = state.get("flags", {}) as Dictionary
 	var repairs: Dictionary = state.get("repairs", {}) as Dictionary
 	if action_id == "ask_work":

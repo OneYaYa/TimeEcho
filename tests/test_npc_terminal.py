@@ -15,6 +15,7 @@ from tools.npc_terminal import (
     available_plot_actions,
     beatrice_commit_status,
     build_request,
+    compile_context,
     default_state,
     infer_plot_action,
     load_world,
@@ -154,6 +155,43 @@ class NpcTerminalContextTests(unittest.TestCase):
         self.assertTrue(any("跳过最后一路" in fact for fact in knowledge["residual"]))
         encoded = json.dumps(request, ensure_ascii=False)
         self.assertNotIn("红色手柄与白色旋钮对应的结局", encoded)
+
+    def test_terminal_compiler_matches_runtime_protocol_and_filters_old_loop(self):
+        npc_state = self.state["npcs"]["arthur"]
+        npc_state["memories"] = [
+            {"memory_id": "memory:old", "text": "上一轮的普通对话", "loop": 0},
+            {"memory_id": "memory:current", "text": "本轮共同检查了主钟", "loop": 1},
+        ]
+        npc_state["dialogue"] = [
+            {"player": "上一轮说过的话", "reply": "上一轮回答", "loop": 0},
+            {"player": "本轮说过的话", "reply": "本轮回答", "loop": 1},
+        ]
+
+        compilation = compile_context(
+            self.world,
+            self.npcs["arthur"],
+            self.state,
+            "还记得吗？",
+        )
+        request = compilation["request"]
+        trace = compilation["trace"]
+
+        self.assertEqual(
+            ["memory:current"],
+            [entry["memory_id"] for entry in request["memories"]],
+        )
+        self.assertEqual(
+            ["本轮说过的话"],
+            [entry["player"] for entry in request["world_state"]["recent_dialogue"]],
+        )
+        self.assertIn("known_beliefs", request["npc_profile"]["knowledge"])
+        self.assertIn("persona_core", request["npc_profile"])
+        self.assertIn("active_scene_mode", request["npc_profile"])
+        self.assertIn("director_intent", request["world_state"])
+        self.assertNotIn("trace", request)
+        self.assertEqual("time-echo-terminal-context-v2", trace["template_version"])
+        self.assertTrue(trace["dropped"])
+        self.assertTrue(trace["partition_token_estimates"])
 
     def test_ada_profile_stays_anonymous_until_her_own_name_anchor(self):
         darkroom = apply_preset(self.state, "darkroom", self.world)

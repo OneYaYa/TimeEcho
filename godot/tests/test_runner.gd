@@ -210,6 +210,50 @@ func _run() -> void:
 	_check(state.get("placeId") == "player-room", "new game starts in room eight")
 	_check(is_equal_approx(float((state.get("player", {}) as Dictionary).get("x", -1.0)), 384.0) and is_equal_approx(float((state.get("player", {}) as Dictionary).get("y", -1.0)), 370.0), "new game uses the retained player-room spawn")
 	_check(int(state.get("minute", 0)) == 360, "loop starts Saturday 06:00")
+	var context_compiler := TimeEchoContextCompiler.new()
+	var ada_compilation: Dictionary = context_compiler.compile("ada", "你叫什么名字？", state, DialogueManager.get_actions("ada", state))
+	var ada_request: Dictionary = ada_compilation.get("request", {}) as Dictionary
+	var ada_profile: Dictionary = ada_request.get("npc_profile", {}) as Dictionary
+	var ada_encoded := JSON.stringify(ada_request)
+	_check(str(ada_profile.get("id", "")) == "hidden_figure" and str(ada_profile.get("name", "")) == "暗房中的潜影", "unanchored Ada uses a staged identity profile")
+	_check(not ada_encoded.contains("中央校准员") and not ada_encoded.contains("第七见证人"), "unanchored Ada context contains no hidden identity facts")
+	_check((ada_profile.get("allowed_actions", []) as Array).any(func(action: Variant) -> bool: return action is Dictionary and str((action as Dictionary).get("id", "")) == "continue_conversation"), "typed context always retains a no-mutation action")
+	_check(((ada_request.get("world_state", {}) as Dictionary).get("flags", {}) as Dictionary).is_empty(), "private world flags never enter the NPC request")
+	var compiler_trace: Dictionary = ada_compilation.get("trace", {}) as Dictionary
+	_check(not str(compiler_trace.get("trace_id", "")).is_empty() and not (compiler_trace.get("partition_token_estimates", {}) as Dictionary).is_empty(), "context compiler emits replay and token-budget trace data")
+	var trace_service := TimeEchoAIService.new()
+	add_child(trace_service)
+	trace_service.online_enabled = false
+	var traced_reply: Dictionary = await trace_service.talk("arthur", "今天风很大。", state)
+	var trace_history: Array = trace_service.get_context_trace_history()
+	_check(not (traced_reply.get("trace", {}) as Dictionary).is_empty() and trace_history.size() == 1, "AI service keeps a bounded local trace for offline and online turns")
+	_check(str((trace_history[0] as Dictionary).get("provider", "")) == "local-rules", "trace records the provider and fallback outcome")
+	trace_service.queue_free()
+
+	var memory_state: Dictionary = GameManager.create_initial_state()
+	var arthur_state: Dictionary = ((memory_state.get("npcs", {}) as Dictionary).get("arthur", {}) as Dictionary)
+	arthur_state["memories"] = [
+		{"memory_id": "memory:old", "subjective_text": "上一轮的普通对话", "loop": 0},
+		{"memory_id": "memory:current", "subjective_text": "本轮共同检查了主钟", "loop": 1},
+	]
+	(memory_state.get("npcNotes", {}) as Dictionary)["arthur"] = [
+		{"event_id": "dialogue:old", "loop": 0, "player": "上一轮", "reply": "旧回复"},
+		{"event_id": "dialogue:current", "loop": 1, "player": "本轮", "reply": "当前回复"},
+	]
+	var memory_compilation: Dictionary = context_compiler.compile("arthur", "还记得吗？", memory_state, DialogueManager.get_actions("arthur", memory_state))
+	var memory_request: Dictionary = memory_compilation.get("request", {}) as Dictionary
+	var compiled_memories: Array = memory_request.get("memories", []) as Array
+	var compiled_dialogue: Array = ((memory_request.get("world_state", {}) as Dictionary).get("recent_dialogue", []) as Array)
+	_check(compiled_memories.size() == 1 and str((compiled_memories[0] as Dictionary).get("memory_id", "")) == "memory:current", "old-loop NPC memory is hard-filtered before retrieval")
+	_check(compiled_dialogue.size() == 1 and str((compiled_dialogue[0] as Dictionary).get("event_id", "")) == "dialogue:current", "old-loop dialogue never enters current context")
+	var persistent_memory: Dictionary = KnowledgeManager.persistent_snapshot(memory_state)
+	_check(not persistent_memory.has("npcNotes"), "ordinary NPC dialogue is excluded from cross-loop persistence")
+	var reset_projection: Dictionary = GameManager.create_initial_state(persistent_memory)
+	_check((reset_projection.get("npcNotes", {}) as Dictionary).is_empty() and (((reset_projection.get("npcs", {}) as Dictionary).get("arthur", {}) as Dictionary).get("memories", []) as Array).is_empty(), "loop reset clears ordinary resident memories")
+	var invalid_commit_state: Dictionary = GameManager.create_initial_state()
+	var rejected_commit: Dictionary = DialogueManager.apply_action("beatrice", "commit_seventh_bell", invalid_commit_state)
+	_check(bool(rejected_commit.get("rejected", false)), "mutation validator rejects an action absent from the current authoritative whitelist")
+	_check(not bool((invalid_commit_state.get("flags", {}) as Dictionary).get("beatrice_rings_seventh", false)), "rejected AI proposal cannot mutate quest state")
 	var before: float = float(state.get("loopElapsed", 0.0))
 	TimeManager.advance(state, 1.0)
 	_check(is_equal_approx(float(state.get("loopElapsed", 0.0)) - before, 2.0), "one real second advances two game minutes")
